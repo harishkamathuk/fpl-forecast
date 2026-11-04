@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from fpl_forecast.operations.config import (
     load_operational_config,
     resolve_operational_paths,
 )
+from fpl_forecast.operations.current_panel import reconstruct_completed_current_season
 from fpl_forecast.operations.launch import LaunchCheck, check_season_launch
 from fpl_forecast.operations.locking import RefreshLock, RefreshLockError
 from fpl_forecast.operations.live_results import validate_event_live_for_forecast
@@ -65,57 +67,144 @@ def refresh_operational(
     paths = resolve_operational_paths(operational_root)
     _ensure_dirs(paths)
     config = load_operational_config()
-    latest = latest_successful(paths.latest_successful_path)
     run_class = (
         "authoritative_publication"
         if authoritative_publication
         else ("test" if mock_launch else "operational")
     )
+    latest = None
     try:
         with RefreshLock(paths.lock_path):
-            launch = _mock_launch_check(season) if mock_launch else check_season_launch(
-                season=season,
-                raw_dir=raw_fpl_dir,
-                offline=offline,
+            latest = latest_successful(paths.latest_successful_path)
+            launch = (
+                _mock_launch_check(season)
+                if mock_launch
+                else check_season_launch(
+                    season=season,
+                    raw_dir=raw_fpl_dir,
+                    offline=offline,
+                )
             )
             if status_only or launch.status.state != OperationalStateName.READY_TO_REFRESH:
                 status = _with_latest(launch.status, latest)
                 write_status(status, paths.status_path)
                 return RefreshResult(status, None, None, None, no_op=False)
-            fingerprint = _input_fingerprint(
-                launch,
-                mock_launch=mock_launch,
-                target_gameweek=target_gameweek,
-                completed_player_fixtures=completed_player_fixtures,
-                completed_team_fixtures=completed_team_fixtures,
-                normalized_dir=normalized_dir,
-                source_state=source_state,
-                run_class=run_class,
-            )
-            if latest and latest.get("input_fingerprint") == fingerprint and not force:
-                status = OperationalStatus(
-                    state=OperationalStateName.SUCCEEDED,
-                    target_season=season,
-                    inferred_official_season=launch.status.inferred_official_season,
-                    checked_at=now_utc(),
-                    latest_official_deadline=launch.status.latest_official_deadline,
-                    latest_successful_run_id=latest.get("run_id"),
-                    reason="Inputs, code and configuration are unchanged; latest successful run reused.",
-                    dashboard_can_display_forecasts=True,
-                    retry_automatically=False,
-                    extra={"no_op": True, "input_fingerprint": fingerprint},
-                )
-                write_status(status, paths.status_path)
-                return RefreshResult(status, latest.get("run_id"), Path(latest["run_dir"]), Path(latest["manifest_path"]), True)
-
             run_id = run_id or f"phase8_operational_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
             temp_dir = paths.output_dir / f".tmp_{run_id}"
-            _assert_run_id_available(run_id, paths=paths, temp_dir=temp_dir)
-            temp_dir.mkdir(parents=True)
             stages: list[str] = []
+            fingerprint = None
+            owns_staging = False
             try:
+                temp_dir.mkdir(parents=True)
+                owns_staging = True
                 _maybe_fail("ingestion", fail_stage)
                 stages.append("launch_checked")
+                cutoff = (
+                    None
+                    if mock_launch
+                    else _resolve_information_cutoff(
+                        season=season,
+                        target_gameweek=target_gameweek,
+                        source_mode="official_current_season",
+                        normalized_dir=normalized_dir,
+                        information_cutoff=information_cutoff,
+                    )
+                )
+                reconstruction_hashes = {}
+                if (
+                    not mock_launch
+                    and target_gameweek > 1
+                    and (completed_player_fixtures is None and completed_team_fixtures is None)
+                ):
+                    reconstruction = reconstruct_completed_current_season(
+                        season=season,
+                        target_gameweek=target_gameweek,
+                        information_cutoff=cutoff,
+                        raw_fpl_dir=raw_fpl_dir,
+                        normalized_dir=Path(normalized_dir),
+                        run_id=run_id,
+                        requested_gameweek=target_gameweek,
+                        git_commit=source_state.get("commit"),
+                        clean_source=not source_state["dirty"],
+                        refresh=not offline,
+                    )
+                    completed_player_fixtures = _read_reconstructed_history(
+                        reconstruction.player_history_path,
+                        reconstruction.player_rows,
+                        season=season,
+                        target_gameweek=target_gameweek,
+                        cutoff=cutoff,
+                    )
+                    completed_team_fixtures = _read_reconstructed_history(
+                        reconstruction.team_history_path,
+                        reconstruction.team_rows,
+                        season=season,
+                        target_gameweek=target_gameweek,
+                        cutoff=cutoff,
+                    )
+                    # Archive exact provenance before any later stage can fail.
+                    manifest = json.loads(reconstruction.manifest_path.read_text(encoding="utf-8"))
+                    if (
+                        manifest.get("season") != season
+                        or manifest.get("resolved_target_gameweek") != target_gameweek
+                        or pd.Timestamp(manifest["information_cutoff"]) != cutoff
+                        or manifest.get("player_fixture_rows") != reconstruction.player_rows
+                        or manifest.get("team_fixture_rows") != reconstruction.team_rows
+                        or not manifest.get("source_hashes")
+                    ):
+                        raise ValueError("Reconstruction manifest does not match refresh inputs.")
+                    reconstruction_hashes = manifest["source_hashes"]
+                    shutil.copyfile(
+                        reconstruction.manifest_path,
+                        temp_dir / "current_season_reconstruction.json",
+                    )
+                    stages.append("current_season_reconstructed")
+                fingerprint = _input_fingerprint(
+                    launch,
+                    mock_launch=mock_launch,
+                    target_gameweek=target_gameweek,
+                    completed_player_fixtures=completed_player_fixtures,
+                    completed_team_fixtures=completed_team_fixtures,
+                    normalized_dir=normalized_dir,
+                    source_state=source_state,
+                    run_class=run_class,
+                )
+                if cutoff is not None:
+                    fingerprint = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "base": fingerprint,
+                                "official_deadline": cutoff.isoformat(),
+                                "reconstruction_source_hashes": reconstruction_hashes,
+                            },
+                            sort_keys=True,
+                        ).encode()
+                    ).hexdigest()
+                if latest and latest.get("input_fingerprint") == fingerprint and not force:
+                    status = OperationalStatus(
+                        state=OperationalStateName.SUCCEEDED,
+                        target_season=season,
+                        inferred_official_season=launch.status.inferred_official_season,
+                        checked_at=now_utc(),
+                        latest_official_deadline=launch.status.latest_official_deadline,
+                        latest_successful_run_id=latest.get("run_id"),
+                        reason="Inputs, code and configuration are unchanged; latest successful run reused.",
+                        dashboard_can_display_forecasts=True,
+                        retry_automatically=False,
+                        extra={"no_op": True, "input_fingerprint": fingerprint},
+                    )
+                    (temp_dir / "current_season_reconstruction.json").unlink(missing_ok=True)
+                    temp_dir.rmdir()
+                    write_status(status, paths.status_path)
+                    return RefreshResult(
+                        status,
+                        latest.get("run_id"),
+                        Path(latest["run_dir"]),
+                        Path(latest["manifest_path"]),
+                        True,
+                    )
+
+                _assert_run_id_available(run_id, paths=paths, temp_dir=None)
                 _maybe_fail("modeling", fail_stage)
                 frontend = _build_frontend_artifacts(
                     temp_dir,
@@ -127,7 +216,7 @@ def refresh_operational(
                     completed_team_fixtures=completed_team_fixtures,
                     normalized_dir=normalized_dir,
                     source_mode="mock" if mock_launch else "official_current_season",
-                    information_cutoff=information_cutoff,
+                    information_cutoff=cutoff,
                 )
                 stages.append("frontend_artifacts_built")
                 _validate_frontend_artifacts(frontend)
@@ -152,7 +241,9 @@ def refresh_operational(
                     "models": config.default_models,
                     "model_lineage": _read_json(temp_dir / "model_lineage.json"),
                     "warnings": ["mock_target_season_transition"] if mock_launch else [],
-                    "fall_back_flags": _lineage_fallback_flags(_read_json(temp_dir / "model_lineage.json")),
+                    "fall_back_flags": _lineage_fallback_flags(
+                        _read_json(temp_dir / "model_lineage.json")
+                    ),
                     "stages": stages,
                     "previous_latest_successful_run_id": latest.get("run_id") if latest else None,
                     "completion_stage": "published",
@@ -164,11 +255,6 @@ def refresh_operational(
                     manifest={**manifest, "input_fingerprint": fingerprint},
                     runs_dir=paths.runs_dir,
                     pointer_path=paths.latest_successful_path,
-                )
-                pointer = json.loads(paths.latest_successful_path.read_text(encoding="utf-8"))
-                pointer["input_fingerprint"] = fingerprint
-                paths.latest_successful_path.write_text(
-                    json.dumps(pointer, indent=2, sort_keys=True), encoding="utf-8"
                 )
                 status = OperationalStatus(
                     state=OperationalStateName.SUCCEEDED,
@@ -182,8 +268,18 @@ def refresh_operational(
                     retry_automatically=False,
                     extra={"run_dir": str(final_dir), "input_fingerprint": fingerprint},
                 )
-                write_status(status, paths.status_path)
-                return RefreshResult(status, run_id, final_dir, final_dir / "run_manifest.json", no_op=False)
+                try:
+                    write_status(status, paths.status_path)
+                except OSError as status_exc:
+                    # The pointer already committed. Never report last-success
+                    # failure or attempt to republish the renamed staging tree.
+                    status = OperationalStatus(**{
+                        **status.__dict__,
+                        "warning": f"Publication committed but status could not be written: {status_exc}",
+                    })
+                return RefreshResult(
+                    status, run_id, final_dir, final_dir / "run_manifest.json", no_op=False
+                )
             except Exception as exc:
                 failed_at = now_utc()
                 manifest = {
@@ -202,12 +298,27 @@ def refresh_operational(
                     "previous_latest_successful_run_id": latest.get("run_id") if latest else None,
                     "stages": stages,
                 }
-                failed_dir = publish_failure(
-                    temp_dir,
-                    run_id=run_id,
-                    manifest=manifest,
-                    failed_runs_dir=paths.failed_dir,
-                )
+                failed_dir = None
+                failure_publication_error = None
+                if owns_staging:
+                    try:
+                        failed_dir = publish_failure(
+                            temp_dir,
+                            run_id=run_id,
+                            manifest=manifest,
+                            failed_runs_dir=paths.failed_dir,
+                        )
+                    except Exception as publication_exc:
+                        # Never overwrite an older failed run or touch unowned staging.
+                        # Retain our staging evidence and still report the original failure.
+                        failure_publication_error = str(publication_exc)
+                status_extra = {"failed_dir": str(failed_dir) if failed_dir else None}
+                if owns_staging and temp_dir.exists():
+                    status_extra["staging_dir"] = str(temp_dir)
+                if failure_publication_error:
+                    status_extra["failure_publication_error"] = failure_publication_error
+                if owns_staging and not temp_dir.exists() and (paths.runs_dir / run_id).exists():
+                    status_extra["unreferenced_run_dir"] = str(paths.runs_dir / run_id)
                 status = OperationalStatus(
                     state=OperationalStateName.FAILED_USING_LAST_SUCCESS,
                     target_season=season,
@@ -219,11 +330,18 @@ def refresh_operational(
                     warning=str(exc),
                     dashboard_can_display_forecasts=bool(latest),
                     retry_automatically=True,
-                    extra={"failed_dir": str(failed_dir)},
+                    extra=status_extra,
                 )
                 write_status(status, paths.status_path)
                 return RefreshResult(status, None, None, None, no_op=False)
-    except RefreshLockError as exc:
+    except Exception as exc:
+        # Launch/pointer parsing can fail before staging exists. Report failure
+        # without touching any caller-owned staging or successful-run evidence.
+        if isinstance(exc, RefreshLockError):
+            try:
+                latest = latest_successful(paths.latest_successful_path)
+            except (OSError, ValueError):
+                latest = None
         status = OperationalStatus(
             state=OperationalStateName.FAILED_USING_LAST_SUCCESS,
             target_season=season,
@@ -295,7 +413,9 @@ def _build_frontend_artifacts(
     if completed_player_fixtures is not None and "official_event_total_points" in completed_player_fixtures.columns:
         issues = validate_event_live_for_forecast(completed_player_fixtures, information_cutoff=cutoff)
         if issues:
-            raise ValueError(f"Completed-result publication safety gate failed: {', '.join(issues)}")
+            raise ValueError(
+                f"Completed-result publication safety gate failed: {', '.join(issues)}"
+            )
     result = run_operational_model_chain(
         season=season,
         run_id=run_id,
@@ -308,7 +428,9 @@ def _build_frontend_artifacts(
         as_of=cutoff,
     )
 
-    projections = result.decision_candidates.loc[result.decision_candidates["model_name"].eq(selected_model)].copy()
+    projections = result.decision_candidates.loc[
+        result.decision_candidates["model_name"].eq(selected_model)
+    ].copy()
     projections = projections.rename(
         columns={
             "player_uid": "stable_player_id",
@@ -381,7 +503,9 @@ def _build_frontend_artifacts(
     comparison_path = temp_dir / "model_comparison.csv"
     result.model_comparison.to_csv(comparison_path, index=False)
     lineage_path = temp_dir / "model_lineage.json"
-    lineage_path.write_text(json.dumps(result.lineage, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    lineage_path.write_text(
+        json.dumps(result.lineage, indent=2, sort_keys=True, default=str), encoding="utf-8"
+    )
     freshness_path = temp_dir / "data_freshness.json"
     freshness_path.write_text(
         json.dumps(
@@ -552,12 +676,12 @@ def _assert_run_id_available(
     run_id: str,
     *,
     paths: OperationalPaths,
-    temp_dir: Path,
+    temp_dir: Path | None,
 ) -> None:
     existing = [
         path
         for path in (paths.runs_dir / run_id, paths.failed_dir / run_id, temp_dir)
-        if path.exists()
+        if path is not None and path.exists()
     ]
     if existing:
         raise FileExistsError(
@@ -659,10 +783,15 @@ def _resolve_information_cutoff(
         return _default_information_cutoff(season, target_gameweek=target_gameweek)
     if source_mode != "official_current_season":
         raise ValueError(f"Unknown operational source mode: {source_mode}")
+    events = pd.read_parquet(Path(normalized_dir) / season / "current_events.parquet")
+    event = events.loc[pd.to_numeric(events["gameweek"], errors="coerce").eq(target_gameweek)]
+    if "season" in event and not event["season"].eq(season).all():
+        raise ValueError("Official event season does not match refresh season.")
     official_deadline = resolve_official_gameweek_deadline(
         season,
         normalized_dir=normalized_dir,
         target_gameweek=target_gameweek,
+        events=events,
     )
     if information_cutoff is None:
         return official_deadline
@@ -675,3 +804,39 @@ def _resolve_information_cutoff(
             "publication preparation deadline."
         )
     return supplied
+
+
+def _read_reconstructed_history(
+    path: Path | None,
+    expected_rows: int,
+    *,
+    season: str,
+    target_gameweek: int,
+    cutoff: pd.Timestamp,
+) -> pd.DataFrame:
+    if path is None or not path.is_file():
+        raise FileNotFoundError(f"Missing reconstructed history: {path}")
+    frame = pd.read_parquet(path)
+    if len(frame) != expected_rows:
+        raise ValueError("Reconstructed history row count changed before forecasting.")
+    if frame.empty:
+        return frame  # Legitimate blank events have no synthetic rows.
+    if not frame["season"].eq(season).all():
+        raise ValueError("Reconstructed history contains a different season.")
+    gameweeks = pd.to_numeric(frame["gameweek"], errors="coerce")
+    available = pd.to_datetime(frame["source_available_time"], utc=True, errors="coerce")
+    if (
+        gameweeks.isna().any()
+        or not gameweeks.between(1, target_gameweek - 1).all()
+        or available.isna().any()
+        or available.ge(cutoff).any()
+        or frame["source_available_method"].isna().any()
+        or not frame["source_available_method"]
+        .isin({
+            "latest_of_bootstrap_fixtures_and_event_live_retrieval",
+            "latest_of_bootstrap_fixtures_event_live_and_historical_club_evidence",
+        })
+        .all()
+    ):
+        raise ValueError("Reconstructed history has invalid temporal provenance.")
+    return frame

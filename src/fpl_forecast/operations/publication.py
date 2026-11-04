@@ -30,7 +30,6 @@ def publish_success(
         raise FileExistsError(f"Refusing to overwrite existing operational run: {final_dir}")
     temp_manifest = temp_dir / "run_manifest.json"
     temp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    temp_dir.rename(final_dir)
     latest_path.parent.mkdir(parents=True, exist_ok=True)
     pointer_tmp = latest_path.with_suffix(".json.tmp")
     pointer = {
@@ -40,8 +39,33 @@ def publish_success(
         "published_at": manifest["completed_at"],
         "schema_version": manifest["frontend_schema_version"],
     }
-    pointer_tmp.write_text(json.dumps(pointer, indent=2, sort_keys=True), encoding="utf-8")
-    pointer_tmp.replace(latest_path)
+    if "input_fingerprint" in manifest:
+        pointer["input_fingerprint"] = manifest["input_fingerprint"]
+    renamed = False
+    try:
+        pointer_tmp.write_text(json.dumps(pointer, indent=2, sort_keys=True), encoding="utf-8")
+        temp_dir.rename(final_dir)
+        renamed = True
+        # This atomic replacement is the publication commit point. No pointer
+        # mutation may follow it in the caller.
+        pointer_tmp.replace(latest_path)
+    except Exception as exc:
+        if renamed:
+            try:
+                final_dir.rename(temp_dir)
+            except OSError as rollback_exc:
+                raise RuntimeError(
+                    f"Publication failed: {exc}; rollback failed: {rollback_exc}; "
+                    f"unreferenced run retained at {final_dir}"
+                ) from exc
+        raise
+    finally:
+        # A stale pointer candidate is never authoritative. Cleanup must not
+        # turn a committed publication into an apparent failure.
+        try:
+            pointer_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
     return final_dir
 
 

@@ -87,6 +87,12 @@ def reconstruct_completed_current_season(
     required_events = events.loc[
         pd.to_numeric(events["gameweek"], errors="coerce").lt(target_gameweek)
     ].sort_values("gameweek")
+    prior_gameweeks = pd.to_numeric(required_events["gameweek"], errors="coerce")
+    if (
+        prior_gameweeks.duplicated().any()
+        or set(prior_gameweeks) != set(range(1, target_gameweek))
+    ):
+        raise ValueError("Prior official event metadata is missing or duplicated.")
     prior_fixtures = fixtures.loc[
         pd.to_numeric(fixtures["gameweek"], errors="coerce").lt(target_gameweek)
     ].copy()
@@ -315,6 +321,15 @@ def reconstruct_completed_current_season(
         _require_rows_before_target(player_history, target_gameweek=target_gameweek, cutoff=cutoff)
     if not team_history.empty:
         _require_rows_before_target(team_history, target_gameweek=target_gameweek, cutoff=cutoff)
+
+    expected_fixtures = set(eligible_fixtures["fixture_id"])
+    for name, frame, fixture_column in (
+        ("player", player_history, "fixture_id"),
+        ("team", team_history, "source_fixture_id"),
+    ):
+        actual_fixtures = set(frame[fixture_column]) if not frame.empty else set()
+        if actual_fixtures != expected_fixtures:
+            raise ValueError(f"Reconstructed {name} history does not cover prior official fixtures.")
 
     player_path = season_dir / "current_player_fixture_history.parquet"
     team_path = season_dir / "current_team_fixture_history.parquet"
@@ -621,6 +636,8 @@ def build_current_team_fixture_history(
     frame["information_cutoff"] = pd.to_datetime(frame["gameweek"].map(deadlines), utc=True)
     frame["fixture_completed"] = frame["finished"].astype(bool) & frame["finished_provisional"].astype(bool)
     frame["result_valid"] = frame["fixture_completed"] & frame[["home_goals", "away_goals"]].notna().all(axis=1)
+    if frame.duplicated(["season", "stable_fixture_uid"]).any():
+        raise ValueError("Current team fixture history contains duplicate fixture observations.")
     if not frame["result_valid"].all():
         raise ValueError("Current team fixture history contains incomplete scores or finality flags.")
     return frame[
