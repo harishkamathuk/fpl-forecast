@@ -11,6 +11,8 @@ import pytest
 
 from fpl_forecast.operations import orchestrator as ops
 
+_REAL_SOURCE_STATE = ops._source_state
+
 
 @pytest.fixture
 def wiring(monkeypatch, tmp_path):
@@ -636,3 +638,16 @@ def test_reconstructed_histories_reject_duplicate_observations(monkeypatch, tmp_
         captured["live_results"].iloc[-1, captured["live_results"].columns.get_loc("minutes")] += 1
         with pytest.raises(ValueError, match="conflicting duplicate"):
             real_builder(**captured)
+
+
+@pytest.mark.parametrize("mock_launch", [False, True])
+def test_stable_source_fingerprint_preserves_noop_without_model_execution(wiring, monkeypatch, mock_launch):
+    monkeypatch.setattr(ops, "_source_state", _REAL_SOURCE_STATE)
+    kwargs = {"mock_launch": mock_launch}
+    if mock_launch:
+        kwargs.update(completed_player_fixtures=wiring.frame,
+                      completed_team_fixtures=wiring.frame)
+    first = wiring.run("stable_source_first", **kwargs)
+    assert first.status.state.value == "SUCCEEDED"
+    assert wiring.run("stable_source_second", **kwargs).no_op
+    assert len(wiring.forwarded) == 1

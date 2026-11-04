@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from typing import Any
+from pathlib import Path
+
+from fpl_forecast.ingest.fpl_api import FPLApiError, load_bootstrap_before_fixture
 
 import numpy as np
 import pandas as pd
@@ -68,9 +71,12 @@ def normalize_event_live(
     resolved_fixture_blocks: Mapping[int, Iterable[dict[str, Any]]] | None = None,
     player_identity_evidence: Mapping[int, Any] | None = None,
     historical_club_assignments: Mapping[tuple[int, int], Any] | None = None,
+    raw_fpl_dir: Path | None = None,
 ) -> pd.DataFrame:
     players = _player_lookup(bootstrap_payload)
     fixtures = _fixture_lookup(fixtures_payload)
+    historical_cache = {}
+    historical_sources = {}
     elements = payload.get("elements")
     if not isinstance(elements, list):
         raise ValueError("Official event-live payload must contain an elements list.")
@@ -100,6 +106,11 @@ def normalize_event_live(
                 for block in explain
                 if block.get("fixture") is not None and int(block["fixture"]) in eligible_fixture_ids
             ]
+        if not explain and eligible_fixture_ids is None and any(
+            _to_number(event_stats.get(k), default=0) != 0
+            for k in (*VALUE_COMPONENTS, "total_points", "starts")
+        ):
+            raise ValueError("Official historical outcomes lack fixture explanations.")
         for fixture_block in explain:
             fixture_id = fixture_block.get("fixture")
             if fixture_id is None or int(fixture_id) not in fixtures:
@@ -112,20 +123,63 @@ def normalize_event_live(
                     f"Official event-live fixture {fixture_id} belongs to gameweek "
                     f"{fixture.get('event')}, not {gameweek}."
                 )
+            fixture_player = player
             assignment = (historical_club_assignments or {}).get((player_id, int(fixture_id)))
             historical_team_id = _evidence_value(assignment, "historical_team_id")
-            if historical_team_id is None:
-                historical_team_id = player.get("team_id")
-            fixture_sides = {
-                int(fixture.get("team_h") or -1),
-                int(fixture.get("team_a") or -1),
-            }
-            if historical_team_id is None or int(historical_team_id) not in fixture_sides:
-                raise ValueError(
-                    "Fixture-specific historical club evidence is required: "
-                    f"player={player_id}, fixture={fixture_id}, candidate_clubs={sorted(fixture_sides)}, "
-                    f"current_club={player.get('team_id')}."
-                )
+            if _evidence_value(assignment, "resolution_method") == "current_bootstrap_fixture_compatible":
+                try:
+                    _require_historical_team_membership(player, fixture)
+                except ValueError:
+                    assignment = None
+            if assignment is None:
+                sides = {fixture.get("team_h"), fixture.get("team_a")}
+                try:
+                    if player.get("team_id") not in sides:
+                        raise ValueError(
+                            f"Official player {player_id} cannot be reconciled to fixture {fixture_id} "
+                            "from the current bootstrap snapshot."
+                        )
+                    _require_historical_team_membership(player, fixture)
+                except ValueError:
+                    if raw_fpl_dir is None:
+                        raise
+                    kickoff = fixture["kickoff_time"]
+                    if kickoff not in historical_cache:
+                        try:
+                            historical_cache[kickoff] = load_bootstrap_before_fixture(
+                                raw_dir=raw_fpl_dir, season=season, kickoff=kickoff,
+                            )
+                        except FPLApiError as exc:
+                            raise ValueError(str(exc)) from exc
+                    historical = historical_cache[kickoff]
+                    historical_player = _player_lookup(historical.payload).get(player_id)
+                    if (not historical_player or type(player.get("player_code")) is not int
+                            or historical_player.get("player_code") != player["player_code"]
+                            or historical_player.get("team_id") not in sides):
+                        raise ValueError(
+                            f"Authoritative historical team evidence cannot resolve player "
+                            f"{player_id} for fixture {fixture_id}."
+                        )
+                    _require_historical_team_membership(historical_player, fixture)
+                    fixture_player = {**player,
+                                      "team_id": historical_player["team_id"],
+                                      "team_uid": historical_player["team_uid"]}
+                    historical_sources[historical.raw_path] = {
+                        "raw_path": historical.raw_path, "metadata": historical.metadata,
+                    }
+                    assignment = {
+                        "historical_team_id": historical_player["team_id"],
+                        "current_team_id": player.get("team_id"),
+                        "resolution_method": "archived_bootstrap_fixture_compatible",
+                        "evidence_endpoint": "bootstrap_static",
+                        "evidence_raw_snapshot_path": historical.raw_path,
+                        "evidence_sha256": historical.metadata["sha256"],
+                        "evidence_retrieved_at": historical.metadata["retrieved_at"],
+                    }
+                historical_team_id = fixture_player.get("team_id")
+            fixture_sides = {fixture.get("team_h"), fixture.get("team_a")}
+            if historical_team_id not in fixture_sides:
+                raise ValueError("Fixture-specific historical club evidence is required.")
             rows.append(
                 _normalised_fixture_row(
                     season=season,
@@ -147,6 +201,7 @@ def normalize_event_live(
         return pd.DataFrame(columns=_output_columns())
     frame = frame[_output_columns()]
     frame = _mark_event_component_mismatches(frame)
+    frame.attrs["historical_bootstrap_snapshots"] = list(historical_sources.values())
     key = ["season", "fixture_id", "player_uid"]
     if frame.duplicated(key).any():
         raise ValueError("Official event-live normalization produced duplicate player-fixture keys.")
@@ -254,6 +309,7 @@ def _normalised_fixture_row(
         "gameweek": gameweek,
         "fixture_id": fixture_id,
         "player_id": player_id,
+        "fixture_team_id": historical_team_id,
         "player_uid": player.get("player_uid", f"official_player_id_{player_id}"),
         "player_code": player.get("player_code"),
         "player_name": player.get("player_name"),
@@ -455,6 +511,7 @@ def _player_lookup(bootstrap_payload: dict[str, Any] | None) -> dict[int, dict[s
             "entity_type": "assistant_manager" if element_type == 5 else "player",
             "fpl_position": POSITION_BY_ELEMENT_TYPE.get(element_type),
             "team_id": element.get("team"),
+            "team_join_date": element.get("team_join_date"),
             "team_uid": team_by_id.get(int(element["team"])) if element.get("team") is not None else None,
         }
     return lookup
@@ -468,6 +525,28 @@ def _fixture_lookup(fixtures_payload: Iterable[dict[str, Any]] | None) -> dict[i
     if len(ids) != len(fixtures) or len(set(ids)) != len(ids):
         raise ValueError("Official fixtures contain missing or duplicate fixture IDs.")
     return {int(fixture["id"]): fixture for fixture in fixtures}
+
+
+def _require_historical_team_membership(player: dict[str, Any], fixture: dict[str, Any]) -> None:
+    """Reject a provably wrong current-club assignment; never infer the old club.
+
+    team_join_date is a current-club date, not an FPL registration timestamp.
+    Missing dates cannot prove historical membership; this check only rejects
+    known contradictions, including when the new club was the old opponent.
+    """
+    if player.get("team_join_date") is None:
+        return
+    joined = pd.Timestamp(player["team_join_date"])
+    kickoff = pd.Timestamp(fixture.get("kickoff_time"))
+    if pd.isna(joined) or pd.isna(kickoff):
+        raise ValueError("Cannot validate historical team membership without valid dates.")
+    joined = joined.tz_localize("UTC") if joined.tzinfo is None else joined.tz_convert("UTC")
+    kickoff = kickoff.tz_localize("UTC") if kickoff.tzinfo is None else kickoff.tz_convert("UTC")
+    if joined > kickoff:
+        raise ValueError(
+            f"Authoritative historical team evidence required: current club join date "
+            f"{joined.isoformat()} is after fixture {fixture.get('id')} kickoff."
+        )
 
 
 def _opponent_uid(fixture: dict[str, Any] | None, player_team_id: int | None) -> str | None:
@@ -518,6 +597,7 @@ def _output_columns() -> list[str]:
         "gameweek",
         "fixture_id",
         "player_id",
+        "fixture_team_id",
         "player_uid",
         "player_code",
         "player_name",

@@ -225,7 +225,12 @@ def reconstruct_completed_current_season(
             resolved_fixture_blocks=resolved.fixture_blocks,
             player_identity_evidence=resolved.identities,
             historical_club_assignments=resolved.club_assignments,
+            raw_fpl_dir=raw_fpl_dir,
         )
+        for source in live.attrs.get("historical_bootstrap_snapshots", []):
+            endpoint = "historical_bootstrap_" + source["metadata"]["sha256"]
+            source_hashes[endpoint] = source["metadata"]["sha256"]
+            snapshot_entries[endpoint] = _snapshot_entry(source["metadata"], source["raw_path"])
         if event_fixtures.empty:
             if not live.empty:
                 raise ValueError(f"Official blank GW{gameweek} unexpectedly produced player-fixture rows.")
@@ -512,7 +517,15 @@ def build_current_player_fixture_history(
     frame["fpl_position"] = frame["fpl_position"].fillna(frame["current_position"])
     frame["entity_type"] = frame["entity_type"].fillna(frame["current_entity_type"])
     frame["current_team_id"] = frame["current_team_id"].fillna(frame["latest_current_team_id"])
+    if "fixture_team_id" in frame:
+        if frame["fixture_team_id"].isna().any():
+            raise ValueError("Current player-fixture history lacks resolved historical team IDs.")
+        conflict = frame["historical_team_id"].notna() & frame["historical_team_id"].astype("Int64").ne(frame["fixture_team_id"].astype("Int64"))
+        if conflict.any():
+            raise ValueError("Historical team assignments contradict fixture-side evidence.")
+        frame["historical_team_id"] = frame["historical_team_id"].fillna(frame["fixture_team_id"])
     frame["historical_team_id"] = frame["historical_team_id"].fillna(frame["latest_current_team_id"])
+    frame["team_id"] = frame["historical_team_id"]
     both_codes = frame["player_code"].notna() & frame["current_player_code"].notna()
     conflicting_codes = both_codes & frame["player_code"].astype("Int64").ne(
         frame["current_player_code"].astype("Int64")

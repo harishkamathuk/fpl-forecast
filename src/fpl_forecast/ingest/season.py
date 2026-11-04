@@ -87,10 +87,22 @@ def infer_and_validate_current_season(
         raise SeasonIdentityError("Cannot infer season: fixtures are missing or empty.")
 
     bootstrap_identity = infer_bootstrap_season(bootstrap_payload)
-    kickoff_times = _parse_required_datetimes(
-        [fixture.get("kickoff_time") for fixture in fixtures_payload if isinstance(fixture, dict)],
-        field_name="fixtures.kickoff_time",
-    )
+    # Unplayed fixtures can legitimately be unassigned/unscheduled. Infer
+    # season from the known dates without deleting those fixtures or inventing
+    # a kickoff. Result-bearing rows still require their actual kickoff.
+    known_kickoffs = []
+    for fixture in fixtures_payload:
+        if not isinstance(fixture, dict) or "kickoff_time" not in fixture:
+            raise SeasonIdentityError("Cannot infer season: missing fixtures.kickoff_time field.")
+        kickoff = fixture["kickoff_time"]
+        if kickoff is None:
+            if any(fixture.get(flag) for flag in ("started", "finished", "finished_provisional")):
+                raise SeasonIdentityError("Result-bearing fixture has no kickoff_time.")
+            if any(fixture.get(score) is not None for score in ("team_h_score", "team_a_score")):
+                raise SeasonIdentityError("Scored fixture has no kickoff_time.")
+        else:
+            known_kickoffs.append(kickoff)
+    kickoff_times = _parse_required_datetimes(known_kickoffs, field_name="fixtures.kickoff_time")
 
     first_deadline = _parse_datetime(bootstrap_identity.first_event_deadline)
     last_deadline = _parse_datetime(bootstrap_identity.last_event_deadline)

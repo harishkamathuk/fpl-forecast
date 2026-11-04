@@ -263,6 +263,9 @@ def _fixtures_frame(
             "pulse_id",
         ],
     )
+    invalid_event = frame["event"].notna() & pd.to_numeric(frame["event"], errors="coerce").isna()
+    if invalid_event.any():
+        raise ValueError("Current fixtures contain malformed gameweek assignments.")
     normalized = pd.DataFrame(
         {
             "fixture_id": pd.to_numeric(frame["id"], errors="coerce").astype("Int64"),
@@ -342,6 +345,17 @@ def _validate_current_players(frame: pd.DataFrame) -> None:
 def _validate_current_fixtures(frame: pd.DataFrame) -> None:
     if frame["fixture_id"].duplicated().any():
         raise ValueError("Current fixtures contain duplicate official fixture IDs.")
-    missing = frame[["gameweek", "home_team_id", "away_team_id", "kickoff_time"]].isna().any(axis=1)
+    missing = frame[["fixture_id", "home_team_id", "away_team_id"]].isna().any(axis=1)
     if missing.any():
         raise ValueError(f"Current fixtures contain {int(missing.sum())} incomplete fixture rows.")
+    gameweeks = pd.to_numeric(frame["gameweek"], errors="coerce")
+    if (gameweeks.notna() & (~gameweeks.between(1, 38) | gameweeks.mod(1).ne(0))).any():
+        raise ValueError("Current fixtures contain invalid gameweek assignments.")
+    kickoff = pd.to_datetime(frame["kickoff_time"], utc=True, errors="coerce")
+    if (frame["kickoff_time"].notna() & kickoff.isna()).any():
+        raise ValueError("Current fixtures contain malformed kickoff_time values.")
+    result_bearing = frame[["started", "finished", "finished_provisional"]].fillna(False).any(axis=1)
+    result_bearing |= frame[["team_h_score", "team_a_score"]].notna().any(axis=1)
+    unknown_schedule = frame[["gameweek", "kickoff_time"]].isna().any(axis=1)
+    if (result_bearing & unknown_schedule).any():
+        raise ValueError("Result-bearing fixtures require a gameweek and kickoff_time.")

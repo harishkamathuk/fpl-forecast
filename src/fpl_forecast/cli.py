@@ -70,6 +70,7 @@ from fpl_forecast.operations.publication_pipeline import (
 )
 from fpl_forecast.operations.transition import run_mock_gw1_to_gw2_transition
 from fpl_forecast.ingest.fpl_api import FPLApiClient, FPLApiError
+from fpl_forecast.operations.prior_event_snapshots import snapshot_prior_event_live
 from fpl_forecast.ingest.vaastav import VaastavDataError, VaastavIngestor
 from fpl_forecast.normalize.current import normalize_current as normalize_current_tables
 from fpl_forecast.normalize.historical import normalize_historical as normalize_historical_tables
@@ -106,6 +107,27 @@ def snapshot_current(
         console.print(f"[red]FPL snapshot failed:[/red] {exc}")
         raise typer.Exit(1) from exc
     _print_records("FPL API snapshots", records)
+
+
+@app.command("snapshot-prior-event-live")
+def snapshot_prior_event_live_command(
+    season: Annotated[str, typer.Option(help="Official season to provision.")],
+    target_gameweek: Annotated[int, typer.Option(min=1, max=38)],
+    raw_dir: Annotated[Path, typer.Option(help="Raw official snapshot directory.")] = RAW_FPL_API_DIR,
+    normalized_dir: Annotated[Path, typer.Option(help="Normalized current tables.")] = NORMALIZED_DIR,
+) -> None:
+    """Provision validated prior results without modeling or publication."""
+    try:
+        records = snapshot_prior_event_live(
+            season=season,
+            target_gameweek=target_gameweek,
+            raw_fpl_dir=raw_dir,
+            normalized_dir=normalized_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Prior event-live provisioning failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    _print_records("Validated prior event-live snapshots", records)
 
 
 @app.command("ingest-historical")

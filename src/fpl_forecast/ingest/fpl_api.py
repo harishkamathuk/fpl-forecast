@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from datetime import UTC, datetime
+from pathlib import Path
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -360,3 +363,37 @@ def load_latest_fpl_snapshot(*, raw_dir=RAW_FPL_API_DIR, season: str, endpoint_n
         raw_path=str(raw_path),
         metadata=metadata,
     )
+
+
+def load_bootstrap_before_fixture(*, raw_dir: Path, season: str, kickoff: str) -> LoadedSnapshot:
+    """Read the latest recorded bootstrap before kickoff; never fetch or backdate."""
+    cutoff = datetime.fromisoformat(kickoff.replace("Z", "+00:00"))
+    candidates = []
+    for path in (Path(raw_dir) / season / BOOTSTRAP_STATIC).glob("*.json"):
+        if path.name.endswith(".metadata.json"):
+            continue
+        metadata = read_metadata(path)
+        retrieved = datetime.fromisoformat(metadata["retrieved_at"].replace("Z", "+00:00"))
+        if retrieved.tzinfo is None or cutoff.tzinfo is None:
+            raise FPLApiError("Historical team evidence requires aware timestamps.")
+        retrieved = retrieved.astimezone(UTC)
+        if retrieved < cutoff:
+            candidates.append((retrieved, path, metadata))
+    if not candidates:
+        raise FPLApiError("No authoritative historical team bootstrap before fixture kickoff.")
+    retrieved, path, metadata = max(candidates, key=lambda row: (row[0], row[1].name))
+    content = path.read_bytes()
+    expected = {
+        "source": "fpl_api", "season": season, "target_season": season,
+        "endpoint_name": BOOTSTRAP_STATIC,
+        "source_url": f"{FPL_API_BASE_URL}bootstrap-static/",
+        "sha256": hashlib.sha256(content).hexdigest(), "content_length": len(content),
+    }
+    if (any(metadata.get(k) != v for k, v in expected.items())
+            or metadata.get("http_status") != 200
+            or Path(metadata["raw_path"]).resolve() != path.resolve()
+            or path.name != retrieved.strftime("%Y%m%dT%H%M%S%fZ") + ".json"):
+        raise FPLApiError("Invalid authoritative historical team bootstrap provenance.")
+    payload = json.loads(content)
+    FPLApiClient._validate_top_level_schema(BOOTSTRAP_STATIC, payload)
+    return LoadedSnapshot(BOOTSTRAP_STATIC, payload, str(path.resolve()), metadata)
